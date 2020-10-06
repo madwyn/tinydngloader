@@ -53,6 +53,8 @@ typedef enum {
   TIFFTAG_YRESOLUTION = 283,  // rational
   TIFFTAG_RESOLUTION_UNIT = 296,
 
+  TIFFTAG_SOFTWARE = 305,
+
   TIFFTAG_SAMPLEFORMAT = 339,
 
   // DNG extension
@@ -158,7 +160,17 @@ class DNGImage {
   bool SetYResolution(double value);
   bool SetResolutionUnit(const unsigned short value);
 
+  ///
+  /// Set arbitrary string for image description.
+  /// Currently we limit to 1024*1024 chars at max.
+  ///
   bool SetImageDescription(const std::string &ascii);
+
+  ///
+  /// Set software description(string).
+  /// Currently we limit to 4095 chars at max.
+  ///
+  bool SetSoftware(const std::string &ascii);
 
   bool SetActiveArea(const unsigned int values[4]);
 
@@ -183,7 +195,7 @@ class DNGImage {
   size_t GetStripBytes() const { return data_strip_bytes_; }
 
   /// Write aux IFD data and strip image data to stream
-  bool WriteDataToStream(std::ostream *ofs, std::string *err) const;
+  bool WriteDataToStream(std::ostream *ofs) const;
 
   ///
   /// Write IFD to stream.
@@ -194,8 +206,7 @@ class DNGImage {
   /// TODO(syoyo): Support multiple strips
   ///
   bool WriteIFDToStream(const unsigned int data_base_offset,
-                        const unsigned int strip_offset, std::ostream *ofs,
-                        std::string *err) const;
+                        const unsigned int strip_offset, std::ostream *ofs) const;
 
   std::string Error() const { return err_; }
 
@@ -205,13 +216,13 @@ class DNGImage {
   bool dng_big_endian_;
   unsigned short num_fields_;
   unsigned int samples_per_pixels_;
-  unsigned short bits_per_sample_;
+  std::vector<unsigned short> bits_per_samples_;
 
   // TODO(syoyo): Support multiple strips
   size_t data_strip_offset_{0};
   size_t data_strip_bytes_{0};
 
-  std::string err_;  // Error message
+  mutable std::string err_;  // Error message
 
   std::vector<IFDTag> ifd_tags_;
 };
@@ -524,7 +535,6 @@ DNGImage::DNGImage()
     : dng_big_endian_(true),
       num_fields_(0),
       samples_per_pixels_(0),
-      bits_per_sample_(0),
       data_strip_offset_{0},
       data_strip_bytes_{0} {
   swap_endian_ = (IsBigEndian() != dng_big_endian_);
@@ -676,7 +686,10 @@ bool DNGImage::SetBitsPerSample(const unsigned int num_samples,
   }
 
   // Store BPS for later use.
-  bits_per_sample_ = bps;
+  bits_per_samples_.resize(num_samples);
+  for (size_t i = 0; i < num_samples; i++) {
+    bits_per_samples_[i] = values[i];
+  }
 
   num_fields_++;
   return true;
@@ -1020,6 +1033,34 @@ bool DNGImage::SetImageDescription(const std::string &ascii) {
   return true;
 }
 
+bool DNGImage::SetSoftware(const std::string &ascii) {
+  unsigned int count =
+      static_cast<unsigned int>(ascii.length() + 1);  // +1 for '\0'
+
+  if (count < 2) {
+    // empty string
+    return false;
+  }
+
+  if (count > 4096) {
+    // too large
+    return false;
+  }
+
+  bool ret = WriteTIFFTag(static_cast<unsigned short>(TIFFTAG_SOFTWARE),
+                          TIFF_ASCII, count,
+                          reinterpret_cast<const unsigned char *>(ascii.data()),
+                          &ifd_tags_, &data_os_);
+
+  if (!ret) {
+    return false;
+  }
+
+  num_fields_++;
+  return true;
+}
+
+
 bool DNGImage::SetActiveArea(const unsigned int values[4]) {
   unsigned int count = 4;
 
@@ -1109,18 +1150,26 @@ static bool IFDComparator(const IFDTag &a, const IFDTag &b) {
   return (a.tag < b.tag);
 }
 
-bool DNGImage::WriteDataToStream(std::ostream *ofs, std::string *err) const {
+bool DNGImage::WriteDataToStream(std::ostream *ofs) const {
   if ((data_os_.str().length() == 0)) {
-    if (err) {
-      (*err) += "Empty IFD data and image data.\n";
-    }
+    err_ += "Empty IFD data and image data.\n";
     return false;
   }
 
-  if ((bits_per_sample_ == 0) || (samples_per_pixels_ == 0)) {
-    if (err) {
-      (*err) += "Both BitsPerSample and SamplesPerPixels must be set.\n";
+  if (bits_per_samples_.empty()) {
+    err_ += "BitsPerSample is not set\n";
+    return false;
+  }
+
+  for (size_t i = 0; i < bits_per_samples_.size(); i++) {
+    if (bits_per_samples_[i] == 0) {
+      err_ += std::to_string(i) + "'th BitsPerSample is zero";
+      return false;
     }
+  }
+
+  if (samples_per_pixels_ == 0) {
+    err_ += "SamplesPerPixels is not set or zero.";
     return false;
   }
 
@@ -1131,10 +1180,11 @@ bool DNGImage::WriteDataToStream(std::ostream *ofs, std::string *err) const {
     // May ok?.
   } else {
     // FIXME(syoyo): Assume all channels use sample bps
+    uint32_t bps = bits_per_samples_[0];
 
     // We may need to swap endian for pixel data.
     if (swap_endian_) {
-      if (bits_per_sample_ == 16) {
+      if (bps == 16) {
         size_t n = data_strip_bytes_ / sizeof(uint16_t);
         uint16_t *ptr =
             reinterpret_cast<uint16_t *>(data.data() + data_strip_offset_);
@@ -1143,7 +1193,7 @@ bool DNGImage::WriteDataToStream(std::ostream *ofs, std::string *err) const {
           swap2(&ptr[i]);
         }
 
-      } else if (bits_per_sample_ == 32) {
+      } else if (bps == 32) {
         size_t n = data_strip_bytes_ / sizeof(uint32_t);
         uint32_t *ptr =
             reinterpret_cast<uint32_t *>(data.data() + data_strip_offset_);
@@ -1152,7 +1202,7 @@ bool DNGImage::WriteDataToStream(std::ostream *ofs, std::string *err) const {
           swap4(&ptr[i]);
         }
 
-      } else if (bits_per_sample_ == 64) {
+      } else if (bps == 64) {
         size_t n = data_strip_bytes_ / sizeof(uint64_t);
         uint64_t *ptr =
             reinterpret_cast<uint64_t *>(data.data() + data_strip_offset_);
@@ -1172,11 +1222,9 @@ bool DNGImage::WriteDataToStream(std::ostream *ofs, std::string *err) const {
 
 bool DNGImage::WriteIFDToStream(const unsigned int data_base_offset,
                                 const unsigned int strip_offset,
-                                std::ostream *ofs, std::string *err) const {
+                                std::ostream *ofs) const {
   if ((num_fields_ == 0) || (ifd_tags_.size() < 1)) {
-    if (err) {
-      (*err) += "No TIFF Tags.\n";
-    }
+    err_ += "No TIFF Tags.\n";
     return false;
   }
 
@@ -1314,7 +1362,7 @@ bool DNGWriter::WriteToFile(const char *filename, std::string *err) const {
   // 4. Write image and meta data
   // TODO(syoyo): Write IFD first, then image/meta data
   for (size_t i = 0; i < images_.size(); i++) {
-    bool ok = images_[i]->WriteDataToStream(&ofs, err);
+    bool ok = images_[i]->WriteDataToStream(&ofs);
     if (!ok) {
       return false;
     }
@@ -1324,7 +1372,7 @@ bool DNGWriter::WriteToFile(const char *filename, std::string *err) const {
   for (size_t i = 0; i < images_.size(); i++) {
     bool ok = images_[i]->WriteIFDToStream(
         static_cast<unsigned int>(data_offset_table[i]),
-        static_cast<unsigned int>(strip_offset_table[i]), &ofs, err);
+        static_cast<unsigned int>(strip_offset_table[i]), &ofs);
     if (!ok) {
       return false;
     }
